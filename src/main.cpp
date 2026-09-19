@@ -7,13 +7,13 @@ FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 const uint8_t MOTOR_ID = 0x7F;     // 127
 const uint16_t HOST_ID = 0xFD;
 
-// 0 = Operation / MIT
-// 1 = Position PP
+// 0 = MIT
+// 1 = Position
 // 2 = Velocity
 // 3 = Current
 // 5 = CSP
 
-uint8_t currentMode = 2;//モード指定
+uint8_t currentMode = 0;//モード指定
 
 // -------- Position PP --------
 float TARGET_POSITION = 0.0f;     
@@ -26,11 +26,23 @@ float TARGET_CURRENT = 2.0f;
 
 // -------- MIT / Operation --------
 float MIT_POSITION = 0.0f;//目標位置
-float MIT_VELOCITY = 0.0f;//目標速度
-float MIT_KP = 10.0f;//比例ゲイン
-float MIT_KD = 1.0f;//微分ゲイン
-float MIT_TORQUE_FF = 0.0f;//トルクフィードフォワード
+float MIT_VELOCITY = 5.0f;//目標速度
+float MIT_KP = 0.0f;//比例ゲイン
+float MIT_KD = 6.0f;//微分ゲイン
+float MIT_TORQUE_FF = 1.0f;//トルクフィードフォワード
 
+//フィードバック
+float actualspeed=0.0f;
+float actualtorque=0.0f;
+//====速度PI制御用パラメータ====
+float speed_kp=0.5f;//速度比例ゲイン
+float speed_ki=0.3f;//速度積分ゲイン
+
+float speed_integral=0.0f;//速度積分値
+float torque_command=0.0f;
+
+const float torque_limit=5.0f;//トルク制限
+const float control_dt=0.02f;//周期制限
 //=================固定設定===================
 const float CURRENT_LIMIT = 10.0f;
 const float ACCELERATION = 5.0f;
@@ -161,9 +173,28 @@ uint16_t floatToUint(float x,float x_min,float x_max)
     return (uint16_t)((x - x_min)* 65535.0f/ (x_max - x_min));
 }
 
+float speedPIControl(){// 速度PI制御
+    float error = MIT_VELOCITY - actualspeed;
+
+    // 積分
+    speed_integral += error * control_dt;
+
+    // 積分ワインドアップ防止
+    const float INTEGRAL_LIMIT = 5.0f;
+
+    if (speed_integral > INTEGRAL_LIMIT)
+        speed_integral = INTEGRAL_LIMIT;
+
+    if (speed_integral < -INTEGRAL_LIMIT)
+        speed_integral = -INTEGRAL_LIMIT;
+
+    // PI計算
+    float correction =speed_kp * error +speed_ki * speed_integral;
+
+    return correction;
+}
 //MIT制御
-void MITControl()
-{
+void MITControl(){
     const float P_MIN = -4.0f * PI;
     const float P_MAX =  4.0f * PI;
 
@@ -181,7 +212,18 @@ void MITControl()
 
     uint16_t kd_int =floatToUint(MIT_KD,0.0f,100.0f);//微分ゲイン
 
-    uint16_t t_int =floatToUint(MIT_TORQUE_FF,T_MIN,T_MAX);//トルクフィードフォワード
+// 速度PIによるトルク補正
+float pi_correction = speedPIControl();
+
+// 重力補償トルク + PI補正
+torque_command =MIT_TORQUE_FF + pi_correction;
+
+// トルク制限
+if (torque_command > torque_limit)torque_command = torque_limit;
+
+if (torque_command < -torque_limit)torque_command = -torque_limit;
+
+uint16_t t_int =floatToUint(torque_command,T_MIN,T_MAX);
 
     CAN_message_t msg;
 
@@ -203,6 +245,14 @@ void MITControl()
     msg.buf[7] = kd_int & 0xFF;
 
     Can1.write(msg);
+    Serial.print("Target V = ");
+    Serial.print(MIT_VELOCITY, 3);
+
+    Serial.print(" | Actual V = ");
+    Serial.print(actualspeed, 3);
+
+    Serial.print(" | Torque Cmd = ");
+    Serial.println(torque_command, 3);
 }
 
 //CSP制御
@@ -254,12 +304,13 @@ void receiveCAN(){
             
             //速度制御
             float speed =((float)rawSpeed / 65535.0f)* 100.0f- 50.0f;
-            
+            actualspeed=speed;
             //rad/sをrpmに変換
             float rpm =speed * 60.0f / (2.0f * PI);
 
             //トルク
             float torque =((float)rawTorque / 65535.0f)* 72.0f- 36.0f;
+            actualtorque=torque;
             //温度
             float temperature =(float)rawTemp / 10.0f;
             
@@ -415,6 +466,7 @@ void loop(){
 
     static unsigned long lastCommand = 0;
 
+    receiveCAN();//CAN受信
     if (!stopped){
         if (millis() - lastCommand >= 20){
             lastCommand = millis();
@@ -423,7 +475,7 @@ void loop(){
         }
     }
 
-    receiveCAN();//CAN受信
+   
 
     //シリアルモニターからの入力を処理
     while (Serial.available() > 0){
